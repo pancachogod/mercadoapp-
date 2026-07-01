@@ -8,6 +8,24 @@ const moneyFormatter = new Intl.NumberFormat('es-ES', {
 });
 
 const SAVED_PRODUCTS_KEY = 'shopping-camera-products';
+const IGNORED_NAME_WORDS = [
+  'ahorro',
+  'antes',
+  'barcode',
+  'cambio',
+  'codigo',
+  'cop',
+  'descuento',
+  'fecha',
+  'iva',
+  'oferta',
+  'precio',
+  'subtotal',
+  'supermercado',
+  'total',
+  'unidad',
+  'unid',
+];
 
 function priceToPesos(value) {
   return Number(value.replace(/\D/g, ''));
@@ -56,30 +74,110 @@ async function getProductByBarcode(code) {
 }
 
 function extractPriceFromText(text) {
-  const matches = text.match(/(?:\$|COP)?\s*(\d{1,3}(?:[.,\s]\d{3})+|\d{4,7})(?:,\d{2})?/gi) || [];
-  const prices = matches
-    .map((match) => priceToPesos(match))
-    .filter((value) => value >= 100 && value <= 2000000);
+  const candidates = text
+    .split('\n')
+    .flatMap((line, lineIndex) => {
+      const matches = line.matchAll(/(?:\$|COP|COL\$)?\s*(\d{1,3}(?:[.,\s]\d{3})+|\d{4,7})(?:[,.)]\d{2})?/gi);
 
-  return prices.length > 0 ? Math.max(...prices) : 0;
+      return Array.from(matches, (match) => {
+        const value = priceToPesos(match[1]);
+        const lowerLine = line.toLowerCase();
+        let score = 0;
+
+        if (value < 100 || value > 2000000) {
+          score -= 100;
+        }
+        if (/\$|cop|col\$/i.test(match[0])) {
+          score += 5;
+        }
+        if (/precio|oferta|antes|ahora|unidad|unid|total|subtotal/i.test(line)) {
+          score += 3;
+        }
+        if (/codigo|barra|nit|tel|factura|fecha|iva/i.test(lowerLine)) {
+          score -= 5;
+        }
+        if (value >= 500 && value <= 300000) {
+          score += 2;
+        }
+
+        return { value, score, lineIndex };
+      });
+    })
+    .filter((candidate) => candidate.value >= 100 && candidate.value <= 2000000)
+    .sort((a, b) => b.score - a.score || a.lineIndex - b.lineIndex || b.value - a.value);
+
+  return candidates[0]?.value || 0;
 }
 
 function guessProductNameFromText(text) {
-  const ignoredWords = ['total', 'precio', 'unidad', 'oferta', 'iva', 'supermercado', 'cop'];
-  const line = text
+  const candidates = text
     .split('\n')
-    .map((value) => value.trim())
-    .find((value) => {
+    .map((value) => value.replace(/[^\p{L}\p{N}\s%.-]/gu, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .map((value, index) => {
       const lowerValue = value.toLowerCase();
-      return (
-        value.length >= 4 &&
-        value.length <= 45 &&
-        !/\d/.test(value) &&
-        !ignoredWords.some((word) => lowerValue.includes(word))
-      );
-    });
+      const letters = value.match(/\p{L}/gu)?.length || 0;
+      const digits = value.match(/\d/g)?.length || 0;
+      let score = letters * 2 - digits * 3;
 
-  return line || '';
+      if (value.length >= 5 && value.length <= 55) {
+        score += 4;
+      }
+      if (/\d{1,3}(?:[.,\s]\d{3})+|\$|cop/i.test(value)) {
+        score -= 12;
+      }
+      if (IGNORED_NAME_WORDS.some((word) => lowerValue.includes(word))) {
+        score -= 10;
+      }
+      if (/^[\d\s.,-]+$/.test(value)) {
+        score -= 20;
+      }
+
+      return { value, score, index };
+    })
+    .filter((candidate) => candidate.score > 3)
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  return candidates[0]?.value || '';
+}
+
+function createOcrCanvas(sourceCanvas) {
+  const maxSide = 1800;
+  const scale = Math.min(maxSide / Math.max(sourceCanvas.width, sourceCanvas.height), 1);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(sourceCanvas.width * scale));
+  canvas.height = Math.max(1, Math.round(sourceCanvas.height * scale));
+
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
+
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+
+  for (let index = 0; index < data.length; index += 4) {
+    const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.75 + 128));
+    const sharpened = contrasted > 170 ? 255 : contrasted < 85 ? 0 : contrasted;
+
+    data[index] = sharpened;
+    data[index + 1] = sharpened;
+    data[index + 2] = sharpened;
+  }
+
+  context.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+async function recognizeTextFromCanvas(canvas) {
+  const ocrCanvas = createOcrCanvas(canvas);
+  const result = await recognize(ocrCanvas, 'spa+eng', {
+    preserve_interword_spaces: '1',
+    tessedit_pageseg_mode: '6',
+  });
+
+  return result.data.text;
 }
 
 function App() {
@@ -110,7 +208,11 @@ function App() {
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' },
+          video: {
+            facingMode: 'environment',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
           audio: false,
         });
 
@@ -162,9 +264,8 @@ function App() {
         }
       }
 
-      setRecognitionStatus('Leyendo texto de la foto para encontrar el precio...');
-      const result = await recognize(canvas, 'spa+eng');
-      const text = result.data.text;
+      setRecognitionStatus('Mejorando la foto y leyendo texto para encontrar nombre y precio...');
+      const text = await recognizeTextFromCanvas(canvas);
       detectedPrice = extractPriceFromText(text);
       detectedName = detectedName || guessProductNameFromText(text);
 
