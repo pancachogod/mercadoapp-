@@ -35,6 +35,10 @@ function formatPesos(pesos) {
   return moneyFormatter.format(pesos);
 }
 
+function uniqueValues(values) {
+  return Array.from(new Set(values));
+}
+
 function getSavedProducts() {
   try {
     return JSON.parse(localStorage.getItem(SAVED_PRODUCTS_KEY)) || {};
@@ -73,8 +77,8 @@ async function getProductByBarcode(code) {
   return data.product.product_name || data.product.generic_name || data.product.brands || '';
 }
 
-function extractPriceFromText(text) {
-  const candidates = text
+function getPriceCandidatesFromText(text) {
+  return text
     .split('\n')
     .flatMap((line, lineIndex) => {
       const matches = line.matchAll(/(?:\$|COP|COL\$)?\s*(\d{1,3}(?:[.,\s]\d{3})+|\d{4,7})(?:[,.)]\d{2})?/gi);
@@ -105,6 +109,27 @@ function extractPriceFromText(text) {
     })
     .filter((candidate) => candidate.value >= 100 && candidate.value <= 2000000)
     .sort((a, b) => b.score - a.score || a.lineIndex - b.lineIndex || b.value - a.value);
+
+}
+
+function extractPriceCandidatesFromText(text) {
+  const candidates = getPriceCandidatesFromText(text);
+  const values = [];
+
+  for (const candidate of candidates) {
+    if (!values.includes(candidate.value)) {
+      values.push(candidate.value);
+    }
+    if (values.length === 4) {
+      break;
+    }
+  }
+
+  return values;
+}
+
+function extractPriceFromText(text) {
+  const candidates = getPriceCandidatesFromText(text);
 
   return candidates[0]?.value || 0;
 }
@@ -141,9 +166,9 @@ function guessProductNameFromText(text) {
   return candidates[0]?.value || '';
 }
 
-function createOcrCanvas(sourceCanvas) {
+function createOcrCanvas(sourceCanvas, mode = 'contrast') {
   const maxSide = 1800;
-  const scale = Math.min(maxSide / Math.max(sourceCanvas.width, sourceCanvas.height), 1);
+  const scale = Math.min(maxSide / Math.max(sourceCanvas.width, sourceCanvas.height), mode === 'original' ? 1 : 1.35);
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(sourceCanvas.width * scale));
   canvas.height = Math.max(1, Math.round(sourceCanvas.height * scale));
@@ -153,13 +178,18 @@ function createOcrCanvas(sourceCanvas) {
   context.imageSmoothingQuality = 'high';
   context.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
 
+  if (mode === 'original') {
+    return canvas;
+  }
+
   const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
   const data = imageData.data;
 
   for (let index = 0; index < data.length; index += 4) {
     const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
-    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.75 + 128));
-    const sharpened = contrasted > 170 ? 255 : contrasted < 85 ? 0 : contrasted;
+    const contrast = mode === 'threshold' ? 2.15 : 1.75;
+    const contrasted = Math.max(0, Math.min(255, (gray - 128) * contrast + 128));
+    const sharpened = mode === 'threshold' ? (contrasted > 145 ? 255 : 0) : contrasted > 170 ? 255 : contrasted < 85 ? 0 : contrasted;
 
     data[index] = sharpened;
     data[index + 1] = sharpened;
@@ -171,13 +201,51 @@ function createOcrCanvas(sourceCanvas) {
 }
 
 async function recognizeTextFromCanvas(canvas) {
-  const ocrCanvas = createOcrCanvas(canvas);
-  const result = await recognize(ocrCanvas, 'spa+eng', {
-    preserve_interword_spaces: '1',
-    tessedit_pageseg_mode: '6',
-  });
+  const texts = [];
 
-  return result.data.text;
+  for (const mode of ['contrast', 'threshold', 'original']) {
+    const ocrCanvas = createOcrCanvas(canvas, mode);
+    const result = await recognize(ocrCanvas, 'spa+eng', {
+      preserve_interword_spaces: '1',
+      tessedit_pageseg_mode: '6',
+    });
+
+    texts.push(result.data.text);
+  }
+
+  return uniqueValues(texts.flatMap((text) => text.split('\n').map((line) => line.trim()).filter(Boolean))).join('\n');
+}
+
+async function improveCameraTrack(stream) {
+  const [track] = stream.getVideoTracks();
+
+  if (!track?.getCapabilities || !track.applyConstraints) {
+    return;
+  }
+
+  const capabilities = track.getCapabilities();
+  const advanced = [];
+
+  if (capabilities.focusMode?.includes('continuous')) {
+    advanced.push({ focusMode: 'continuous' });
+  }
+  if (capabilities.exposureMode?.includes('continuous')) {
+    advanced.push({ exposureMode: 'continuous' });
+  }
+  if (capabilities.whiteBalanceMode?.includes('continuous')) {
+    advanced.push({ whiteBalanceMode: 'continuous' });
+  }
+  if (capabilities.zoom?.max && capabilities.zoom.max >= 1.25) {
+    advanced.push({ zoom: Math.min(1.4, capabilities.zoom.max) });
+  }
+
+  if (advanced.length > 0) {
+    try {
+      await track.applyConstraints({ advanced });
+    } catch {
+      // Some mobile browsers expose capabilities but reject individual constraints.
+    }
+  }
 }
 
 function App() {
@@ -191,6 +259,7 @@ function App() {
   const [barcode, setBarcode] = useState('');
   const [name, setName] = useState('');
   const [price, setPrice] = useState('');
+  const [priceCandidates, setPriceCandidates] = useState([]);
   const [quantity, setQuantity] = useState('1');
   const [recognitionStatus, setRecognitionStatus] = useState('');
   const [isRecognizing, setIsRecognizing] = useState(false);
@@ -210,12 +279,13 @@ function App() {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: 'environment',
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            width: { ideal: 2560 },
+            height: { ideal: 1440 },
           },
           audio: false,
         });
 
+        await improveCameraTrack(stream);
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -235,6 +305,7 @@ function App() {
 
   async function recognizeProductFromCanvas(canvas) {
     setBarcode('');
+    setPriceCandidates([]);
     setRecognitionStatus('Buscando codigo de barras, nombre y precio en la foto...');
 
     setIsRecognizing(true);
@@ -266,11 +337,15 @@ function App() {
 
       setRecognitionStatus('Mejorando la foto y leyendo texto para encontrar nombre y precio...');
       const text = await recognizeTextFromCanvas(canvas);
+      const detectedPriceCandidates = extractPriceCandidatesFromText(text);
       detectedPrice = extractPriceFromText(text);
       detectedName = detectedName || guessProductNameFromText(text);
 
+      setPriceCandidates(detectedPriceCandidates);
       if (detectedName) {
         setName(detectedName);
+      } else {
+        setName('Producto detectado');
       }
       if (detectedPrice) {
         setPrice(String(detectedPrice));
@@ -279,11 +354,11 @@ function App() {
       if (detectedName && detectedPrice) {
         setRecognitionStatus('Nombre y precio detectados automaticamente. Revisa antes de sumar.');
       } else if (detectedName) {
-        setRecognitionStatus('Nombre detectado automaticamente. No se encontro un precio claro en la foto.');
+        setRecognitionStatus('Nombre detectado. No se encontro un precio claro: acerca la camara a la etiqueta de precio.');
       } else if (detectedPrice) {
-        setRecognitionStatus('Precio detectado automaticamente. No se encontro un nombre claro en la foto.');
+        setRecognitionStatus('Precio detectado. No se encontro un nombre claro, puedes editar el nombre antes de sumar.');
       } else {
-        setRecognitionStatus('No se pudo detectar nombre ni precio. Usa una foto donde se vea el codigo de barras o la etiqueta de precio.');
+        setRecognitionStatus('No se pudo detectar un precio claro. Toma la foto de frente, con buena luz y acercate a la etiqueta.');
       }
     } catch {
       setRecognitionStatus('No se pudo reconocer automaticamente. Intenta con una foto mas clara del codigo o la etiqueta.');
@@ -303,7 +378,7 @@ function App() {
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-    setPhoto(canvas.toDataURL('image/jpeg', 0.88));
+    setPhoto(canvas.toDataURL('image/jpeg', 0.95));
     await recognizeProductFromCanvas(canvas);
   }
 
@@ -320,7 +395,7 @@ function App() {
       canvas.width = image.naturalWidth;
       canvas.height = image.naturalHeight;
       canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
-      setPhoto(canvas.toDataURL('image/jpeg', 0.88));
+      setPhoto(canvas.toDataURL('image/jpeg', 0.95));
       await recognizeProductFromCanvas(canvas);
       URL.revokeObjectURL(image.src);
       event.target.value = '';
@@ -358,6 +433,7 @@ function App() {
     setQuantity('1');
     setPhoto('');
     setBarcode('');
+    setPriceCandidates([]);
     setRecognitionStatus('');
   }
 
@@ -390,7 +466,16 @@ function App() {
             {cameraError ? (
               <div className="camera-message">{cameraError}</div>
             ) : (
-              <video ref={videoRef} autoPlay playsInline muted />
+              <>
+                <video ref={videoRef} autoPlay playsInline muted />
+                <div className="scan-overlay" aria-hidden="true">
+                  <span className="scan-corner top-left" />
+                  <span className="scan-corner top-right" />
+                  <span className="scan-corner bottom-left" />
+                  <span className="scan-corner bottom-right" />
+                  <p>{isRecognizing ? 'Analizando foto...' : 'Centra el nombre o la etiqueta de precio'}</p>
+                </div>
+              </>
             )}
           </div>
           <button className="primary-button" type="button" onClick={takePhoto} disabled={!cameraReady || isRecognizing}>
@@ -399,7 +484,7 @@ function App() {
           <button className="secondary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={isRecognizing}>
             Subir desde galeria
           </button>
-          <input ref={fileInputRef} className="file-input" type="file" accept="image/*" onChange={uploadPhoto} />
+          <input ref={fileInputRef} className="file-input" type="file" accept="image/*" capture="environment" onChange={uploadPhoto} />
           {recognitionStatus && <p className="recognition-status">{recognitionStatus}</p>}
           <canvas ref={canvasRef} hidden />
         </div>
@@ -428,6 +513,16 @@ function App() {
               type="text"
             />
           </label>
+          {priceCandidates.length > 1 && (
+            <div className="price-candidates" aria-label="Precios posibles detectados">
+              <span>Precios posibles:</span>
+              {priceCandidates.map((candidate) => (
+                <button type="button" key={candidate} onClick={() => setPrice(String(candidate))}>
+                  {formatPesos(candidate)}
+                </button>
+              ))}
+            </div>
+          )}
           <label>
             Cantidad
             <input

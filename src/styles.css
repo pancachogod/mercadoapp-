@@ -126,6 +126,7 @@ h2 {
 }
 
 .camera-frame {
+  position: relative;
   aspect-ratio: 16 / 10;
   margin-bottom: 16px;
 }
@@ -134,8 +135,82 @@ h2 {
 .photo-preview img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   display: block;
+}
+
+.camera-frame video {
+  background: #07140a;
+}
+
+.scan-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.2));
+}
+
+.scan-overlay::before {
+  content: "";
+  width: min(76%, 520px);
+  aspect-ratio: 16 / 7;
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  border-radius: 22px;
+  box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.22);
+}
+
+.scan-overlay p {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  width: min(calc(100% - 28px), 420px);
+  margin: 0;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  padding: 10px 14px;
+  color: #fff;
+  background: rgba(7, 20, 10, 0.76);
+  font-size: 0.9rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.scan-corner {
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  border-color: #9dff76;
+  border-style: solid;
+}
+
+.top-left {
+  top: 26%;
+  left: 12%;
+  border-width: 4px 0 0 4px;
+  border-top-left-radius: 14px;
+}
+
+.top-right {
+  top: 26%;
+  right: 12%;
+  border-width: 4px 4px 0 0;
+  border-top-right-radius: 14px;
+}
+
+.bottom-left {
+  bottom: 26%;
+  left: 12%;
+  border-width: 0 0 4px 4px;
+  border-bottom-left-radius: 14px;
+}
+
+.bottom-right {
+  right: 12%;
+  bottom: 26%;
+  border-width: 0 4px 4px 0;
+  border-bottom-right-radius: 14px;
 }
 
 .camera-message,
@@ -184,6 +259,26 @@ h2 {
 
 .price-note {
   margin-top: -4px;
+}
+
+.price-candidates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: -8px;
+  color: #5b6a5d;
+  font-size: 0.88rem;
+  font-weight: 800;
+}
+
+.price-candidates button {
+  border: 1px solid rgba(39, 116, 61, 0.2);
+  border-radius: 999px;
+  padding: 8px 10px;
+  color: #27743d;
+  background: #eef8e7;
+  font-weight: 900;
 }
 
 .product-form {
